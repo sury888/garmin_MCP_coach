@@ -20,12 +20,12 @@ from workout_recommendation import evaluate_planned_workout
 from database import save_planned_workout, get_planned_workout
 from activity_details import parse_activity_details
 from interval_recovery import analyze_interval_recovery
-from garmin_client import GarminClient
+from garmin_client import GarminClient, get_garmin_client
 from intervals_analysis import (
     analyze_garmin_laps,
     analyze_structured_swim,
 )
-from sync import sync_latest_garmin_data, sync_activity_history as sync_activity_history_data
+from sync import sync_latest_garmin_data, sync_activity_history as sync_activity_history_data, sync_garmin_history as sync_garmin_history_data
 from training_load import build_training_load, get_training_load, get_current_training_load
 from database import AthleteProfile, get_session
 from weather_context import fetch_activity_weather, get_activity_weather
@@ -36,6 +36,7 @@ from performance_engine import (
     process_activity_performance, get_hr_controlled_records,
     get_highest_hr_history, get_leaderboard, get_durability_records,
 )
+from performance_queries import get_best_performance, get_time_in_zone, set_training_zones
 
 mcp = MCPServer("Garmin Coach")
 
@@ -117,6 +118,52 @@ def get_durability_performance(sport: str | None = None, window_days: int | None
     """Return long-session and brick durability records."""
     return {"sport":sport,"window_days":window_days,"records":get_durability_records(sport,window_days)}
 
+@mcp.tool()
+def get_best_performance_query(
+    sport: str,
+    target: float,
+    metric: str = "auto",
+    window_days: int = 30,
+    swim_stroke: str | None = None,
+    period: str | None = None,
+) -> dict:
+    """Find the best arbitrary run/swim distance or bike duration.
+
+    Run/swim targets are meters; bike targets are seconds. This complements
+    the cached peak-performance curve and supports arbitrary queries.
+    """
+    return get_best_performance(sport, target, metric, window_days, swim_stroke, period)
+
+@mcp.tool()
+def set_training_zones_tool(config: dict) -> dict:
+    """Save range-based athlete-defined training zones.
+
+    Bounds are inclusive; use null for an open lower/upper bound. Six zones
+    (1-6) are supported. Run and bike use HR OR the sport metric; swim uses
+    pace only. Units: run HR bpm + sec/mile, bike HR bpm + watts, swim sec/100m.
+
+    Example:
+    {
+      "run": {
+        "3": {"hr_bpm_min": 158, "hr_bpm_max": 170,
+              "pace_sec_per_mile_min": 420, "pace_sec_per_mile_max": 490}
+      },
+      "bike": {
+        "3": {"hr_bpm_min": 141, "hr_bpm_max": 162,
+              "power_w_min": 147, "power_w_max": 188}
+      },
+      "swim": {
+        "3": {"pace_sec_per_100m_min": 86, "pace_sec_per_100m_max": 89}
+      }
+    }
+    """
+    return set_training_zones(config)
+
+@mcp.tool()
+def get_time_in_zone_tool(sport: str, zone: int | str = 3, window_days: int = 7, period: str | None = None) -> dict:
+    """Return time spent in a training zone over the requested window."""
+    return get_time_in_zone(sport, zone, window_days, period)
+
 
 # ============================================================
 # CURRENT HEALTH
@@ -128,6 +175,16 @@ def sync_garmin_now() -> dict:
     return sync_latest_garmin_data()
 
 @mcp.tool()
+def sync_garmin_history(days: int = 7) -> dict:
+    """
+    Backfill both daily health and activities over an arbitrary number
+    of days (not limited to 7). Activities and health are synced
+    independently, so a failure in one is reported without blocking
+    or invalidating the other.
+    """
+    return sync_garmin_history_data(days=days)
+
+@mcp.tool()
 def get_activity_full_report(
     activity_id: int,
 ) -> dict:
@@ -135,8 +192,7 @@ def get_activity_full_report(
     Return all Garmin lap/split data available for an activity.
     """
 
-    garmin = GarminClient()
-    garmin.login()
+    garmin = get_garmin_client()
 
     details = garmin.get_activity_details(
         activity_id
@@ -190,8 +246,7 @@ def analyze_structured_activity(
     using Garmin-native laps.
     """
 
-    garmin = GarminClient()
-    garmin.login()
+    garmin = get_garmin_client()
 
     splits = garmin.get_activity_splits(
         activity_id
@@ -249,8 +304,7 @@ def analyze_swim_activity(
 ) -> dict:
     """Analyze Garmin-native swim laps."""
 
-    garmin = GarminClient()
-    garmin.login()
+    garmin = get_garmin_client()
 
     splits = garmin.get_activity_splits(
         activity_id

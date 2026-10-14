@@ -23,14 +23,30 @@ def get_garmin():
     return _garmin
 
 
-def sync_day(garmin, day):
+def sync_day(garmin, day, sync_activities=True):
     """
-    Sync one day's health data and activities.
+    Sync one day's health data and, optionally, activities.
+
+    Returns a structured result dict instead of only printing, so
+    callers can tell exactly what succeeded/failed for this day rather
+    than inferring it from stdout. `sync_activities=False` skips the
+    (expensive, paginated) full-history activity pull below, for
+    callers that already sync activities separately -- this also
+    avoids redundantly re-pulling the whole activity list once per day
+    in a multi-day loop.
     """
 
     day_string = day.isoformat()
 
     print(f"\nSyncing {day_string}...")
+
+    result = {
+        "date": day_string,
+        "health_saved": False,
+        "health_error": None,
+        "activities_saved": 0,
+        "activities_error": None,
+    }
 
     # =========================================================
     # DAILY HEALTH
@@ -70,26 +86,33 @@ def sync_day(garmin, day):
 
         save_daily_health(daily_health)
 
+        result["health_saved"] = True
         print("  ✓ Daily health")
 
     except Exception as e:
+        result["health_error"] = f"{type(e).__name__}: {e}"
         print(f"  ✗ Daily health: {e}")
 
     # =========================================================
     # ACTIVITIES
     # =========================================================
 
-    try:
-        activities = garmin.get_all_activities(max_activities=1000)
-        saved = 0
-        for raw in activities:
-            parsed = parse_activity(raw)
-            if parsed.get("activity_date") == day:
-                save_activity(parsed)
-                saved += 1
-        print(f"  ✓ Activities ({saved})")
-    except Exception as e:
-        print(f"  ✗ Activities: {e}")
+    if sync_activities:
+        try:
+            activities = garmin.get_all_activities(max_activities=1000)
+            saved = 0
+            for raw in activities:
+                parsed = parse_activity(raw)
+                if parsed.get("activity_date") == day:
+                    save_activity(parsed)
+                    saved += 1
+            result["activities_saved"] = saved
+            print(f"  ✓ Activities ({saved})")
+        except Exception as e:
+            result["activities_error"] = f"{type(e).__name__}: {e}"
+            print(f"  ✗ Activities: {e}")
+
+    return result
 
 
 def sync_history(days=30):
@@ -242,62 +265,203 @@ def sync_activity_history(days=3650, chunk_days=30):
     }
 
 
+def sync_garmin_history(days=7):
+    """
+    Backfill both activities and daily health over an arbitrary number
+    of days (not limited to 7).
+
+    Reuses the existing, already-working sync_activity_history() for
+    the activities side (chunked date-range pulls, handles arbitrary
+    history lengths), and sync_day(..., sync_activities=False) for the
+    health side, so health backfill never redundantly re-pulls the
+    full activity list once per day. Activities and health are synced
+    independently: a failure in one is recorded but does not prevent
+    or invalidate the other.
+    """
+    initialize_database()
+
+    errors = []
+
+    # ACTIVITIES -- reuse the existing chunked backfill implementation.
+    activity_result = sync_activity_history(days=days)
+    errors.extend(activity_result.get("errors", []))
+
+    # HEALTH -- independent of the activities sync above.
+    today = date.today()
+    start_date = today - timedelta(days=max(0, days - 1))
+
+    garmin = None
+    health_days_attempted = 0
+    health_days_saved = 0
+
+    try:
+        garmin = GarminClient()
+        garmin.login()
+    except Exception as e:
+        errors.append({
+            "stage": "health_login",
+            "error": f"{type(e).__name__}: {e}",
+        })
+
+    if garmin is not None:
+        import time
+
+        for days_ago in range(days):
+            day = today - timedelta(days=days_ago)
+            health_days_attempted += 1
+
+            day_result = sync_day(garmin, day, sync_activities=False)
+
+            if day_result.get("health_saved"):
+                health_days_saved += 1
+            else:
+                errors.append({
+                    "stage": "health",
+                    "date": day_result.get("date", day.isoformat()),
+                    "error": day_result.get("health_error"),
+                })
+
+            time.sleep(2)
+
+    return {
+        "success": len(errors) == 0,
+        "start_date": start_date.isoformat(),
+        "end_date": today.isoformat(),
+        "days_requested": days,
+        "activities_seen": activity_result.get("activities_seen", 0),
+        "activities_saved": activity_result.get("activities_saved", 0),
+        "health_days_attempted": health_days_attempted,
+        "health_days_saved": health_days_saved,
+        "errors": errors,
+    }
+
+
 def sync_latest_garmin_data():
     """
     Sync recent Garmin data needed for coaching decisions.
+
+    Activities and health are synced independently of each other, and
+    each health day is attempted independently of the other -- a
+    failure in any one stage is captured in `errors` rather than
+    aborting the whole call. The sync is only marked complete (see
+    freshness.mark_sync_complete, which gates is_data_fresh()) when
+    both health days this tool promises -- today and yesterday -- were
+    actually saved. A partial result is reported as partial, never
+    silently treated as current.
     """
 
     initialize_database()
 
-    garmin = GarminClient()
-    garmin.login()
-
-    today = date.today()
+    errors = []
+    synced_at = datetime.now().isoformat()
 
     # ---------------------------------------------------------
-    # ACTIVITIES
+    # LOGIN
     # ---------------------------------------------------------
 
-    activities = garmin.get_activities(limit=20)
+    garmin = None
 
-    for activity in activities:
+    try:
+        garmin = GarminClient()
+        garmin.login()
+    except Exception as e:
+        errors.append({
+            "stage": "login",
+            "error": f"{type(e).__name__}: {e}",
+        })
 
+    # ---------------------------------------------------------
+    # ACTIVITIES -- independent of health below.
+    # ---------------------------------------------------------
+
+    activities_synced = 0
+
+    if garmin is not None:
         try:
-            parsed = parse_activity(activity)
-            save_activity(parsed)
+            activities = garmin.get_activities(limit=20)
+
+            for activity in activities:
+                try:
+                    parsed = parse_activity(activity)
+                    save_activity(parsed)
+                    activities_synced += 1
+
+                except Exception as e:
+                    errors.append({
+                        "stage": "activity",
+                        "activity_id": activity.get("activityId") if isinstance(activity, dict) else None,
+                        "error": f"{type(e).__name__}: {e}",
+                    })
 
         except Exception as e:
-            print(f"Activity sync error: {e}")
+            errors.append({
+                "stage": "activities_fetch",
+                "error": f"{type(e).__name__}: {e}",
+            })
 
     # ---------------------------------------------------------
-    # HEALTH
+    # HEALTH -- today and yesterday, each attempted independently.
+    # Garmin metrics can sometimes finalize after the calendar day
+    # changes, which is why both days are re-attempted on every call.
+    # sync_activities=False here because activities were already
+    # synced above; re-pulling the full activity history once per day
+    # was redundant and is the likely cause of this tool's previous
+    # intermittent failures under Garmin API load.
     # ---------------------------------------------------------
 
-    # Sync today and yesterday because Garmin metrics can
-    # sometimes finalize after the calendar day changes.
+    today = date.today()
+    health_days_saved = 0
+    health_results = []
 
-    for days_ago in range(2):
+    if garmin is not None:
+        for days_ago in range(2):
+            day = today - timedelta(days=days_ago)
 
-        day = today - timedelta(days=days_ago)
+            try:
+                day_result = sync_day(garmin, day, sync_activities=False)
+            except Exception as e:
+                # sync_day() already catches its own errors; this guards
+                # against anything unexpected escaping it, so one bad day
+                # can never take the other day down with it.
+                day_result = {
+                    "date": day.isoformat(),
+                    "health_saved": False,
+                    "health_error": f"{type(e).__name__}: {e}",
+                }
 
-        sync_day(
-            garmin,
-            day,
-        )
+            health_results.append(day_result)
+
+            if day_result.get("health_saved"):
+                health_days_saved += 1
+            else:
+                errors.append({
+                    "stage": "health",
+                    "date": day_result.get("date", day.isoformat()),
+                    "error": day_result.get("health_error"),
+                })
 
     # ---------------------------------------------------------
-    # MARK SUCCESSFUL SYNC
+    # MARK SUCCESSFUL SYNC -- only when both promised health days
+    # actually saved. Never mark the database current on a partial
+    # or failed sync.
     # ---------------------------------------------------------
 
-    from freshness import mark_sync_complete
+    sync_marked_complete = False
 
-    mark_sync_complete()
+    if garmin is not None and health_days_saved == 2:
+        from freshness import mark_sync_complete
+
+        mark_sync_complete()
+        sync_marked_complete = True
 
     return {
-        "success": True,
-        "synced_at": datetime.now().isoformat(),
-        "activities_synced": len(activities),
-        "health_days_synced": 2,
+        "success": len(errors) == 0,
+        "synced_at": synced_at,
+        "activities_synced": activities_synced,
+        "health_days_synced": health_days_saved,
+        "health_results": health_results,
+        "sync_marked_complete": sync_marked_complete,
+        "errors": errors,
     }
 
 if __name__ == "__main__":

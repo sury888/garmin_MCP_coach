@@ -228,6 +228,11 @@ def initialize_database():
                 if name not in existing:
                     conn.execute(text(f"ALTER TABLE activity_annotations ADD COLUMN {name} {sql_type}"))
 
+        if "athlete_profile" in tables:
+            existing = {c["name"] for c in inspector.get_columns("athlete_profile")}
+            if "training_zones_json" not in existing:
+                conn.execute(text("ALTER TABLE athlete_profile ADD COLUMN training_zones_json TEXT"))
+
 
 def get_session():
     session = SessionLocal()
@@ -424,6 +429,7 @@ class AthleteProfile(Base):
     run_threshold_pace_sec_per_km = Column(Float)
     css_sec_per_100m = Column(Float)
     weight_kg = Column(Float)
+    training_zones_json = Column(String)
 
 
 class DailyTrainingLoad(Base):

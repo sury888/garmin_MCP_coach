@@ -163,15 +163,8 @@ def analyze_interval_recovery(
                 if not isinstance(item, dict):
                     extracted.append(None)
                     continue
-                pace = None
-                for key in (
-                    "pace", "manual_pace", "target_pace", "pace_per_mile",
-                    "pace_per_mi", "actual_pace", "reported_pace",
-                ):
-                    value = item.get(key)
-                    if value is not None and str(value).strip():
-                        pace = str(value).strip()
-                        break
+                value = item.get("target_pace")
+                pace = str(value).strip() if value is not None and str(value).strip() else None
                 extracted.append(pace)
             if extracted and any(v is not None for v in extracted):
                 manual_work_target_paces = extracted
