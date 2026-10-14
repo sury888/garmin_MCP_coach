@@ -4,8 +4,38 @@ __pycache__/
 build/
 dist/
 wheels/
-*.egg-info
+*.egg-info/
 
 # Virtual environments
-.venv
+.venv/
+venv/
+env/
+
+# Secrets and local environment configuration
 .env
+.env.*
+!.env.example
+
+# Local databases and personal Garmin history
+*.db
+*.sqlite
+*.sqlite3
+
+# Authentication/session caches (names may vary by library/version)
+.garth/
+.garminconnect/
+tokens/
+*.token
+*token*.json
+*session*.json
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+
+# Editor / operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
