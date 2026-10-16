@@ -145,17 +145,38 @@ check("stroke filter with no matching stroke -> none", r is None, str(r))
 r = best([L("FREESTYLE", 22.0)] * 2 + [L("BUTTERFLY", 26.0)] * 2, 100, "free")
 check("filter 'free' cannot absorb adjacent butterfly", r is None, str(r))
 
-# 7. Plausibility: 100m in 0.7 s rejected; floor applied consistently.
+# 7. Plausibility: 100m in 0.7 s rejected. ONE floor (36.0 s/100m) is applied to
+#    individual lengths AND complete efforts, in meters / seconds.
 r = best([L("FREESTYLE", 0.175)] * 4, 100)
 check("100m in 0.7 s rejected", r is None, str(r))
 check("_swim_pr_pace_ok(100 m, 0.7 s) is False", pq._swim_pr_pace_ok(100.0, 0.7) is False)
-check("30.0 s/100m exactly is allowed (100 m in 30.0 s)", pq._swim_pr_pace_ok(100.0, 30.0) is True)
-check("29.9 s/100m rejected (100 m in 29.9 s)", pq._swim_pr_pace_ok(100.0, 29.9) is False)
-check("same floor per length: 25 m in 7.5 s ok, 7.4 s not", pq._swim_pr_pace_ok(25.0, 7.5) and not pq._swim_pr_pace_ok(25.0, 7.4))
-r = best([L("FREESTYLE", 7.4)] * 4, 100)
-check("4 x 25m in 7.4 s each (29.6 s/100m) rejected", r is None, str(r))
-r = best([L("FREESTYLE", 7.5)] * 4, 100)
-check("4 x 25m in 7.5 s each (30.0 s/100m) accepted at the floor", r is not None and abs(r["time_seconds"] - 30.0) < 1e-9, str(r))
+check("floor constant is 36.0 s/100m", pq._SWIM_PR_MIN_PACE_S_PER_100M == 36.0)
+# individual lengths
+check("length: 25 m in 9.0 s (36.0/100m) ok", pq._swim_pr_pace_ok(25.0, 9.0))
+check("length: 25 m in 8.9 s (35.6/100m) rejected", not pq._swim_pr_pace_ok(25.0, 8.9))
+check("length: 25 m in 6.053 s (24.2/100m) rejected", not pq._swim_pr_pace_ok(25.0, 6.053))
+r = best([L("FREESTYLE", 9.0)] * 2, 50)
+check("50m = 2 x 9.0 s lengths accepted at floor (18.0 s)", r is not None and abs(r["time_seconds"] - 18.0) < 1e-9, str(r))
+r = best([L("FREESTYLE", 8.9)] * 2, 50)
+check("50m = 2 x 8.9 s lengths rejected (implausible lengths are barriers)", r is None, str(r))
+r = best([L("FREESTYLE", 9.0), L("FREESTYLE", 8.9), L("FREESTYLE", 9.0)], 50)
+check("one implausible length splits an otherwise-valid run", r is None, str(r))
+# complete efforts
+for d, t, ok in ((50, 18.0, True), (50, 17.9, False), (100, 36.0, True), (100, 35.9, False), (400, 144.0, True), (400, 143.9, False)):
+    check(f"effort: {d} m in {t} s -> {'ok' if ok else 'rejected'}", pq._swim_pr_pace_ok(float(d), t) is ok)
+r = best([L("FREESTYLE", 9.0)] * 4, 100)
+check("100m = 4 x 9.0 s accepted at floor (36.0 s)", r is not None and abs(r["time_seconds"] - 36.0) < 1e-9, str(r))
+# property: no returned effort is ever faster than the floor
+import random
+random.seed(7)
+worst = 1e9
+for _ in range(200):
+    seq = [L(random.choice(["FREESTYLE", "BUTTERFLY"]), random.uniform(5.0, 40.0)) for _ in range(random.randint(2, 24))]
+    for tgt in (50, 100, 200, 250, 400):
+        rr = best(seq, tgt)
+        if rr:
+            worst = min(worst, rr["pace_seconds_per_100m"])
+check("property: 200 random swims, no returned PR pace below 36.0 s/100m", worst >= 36.0 - 1e-9, f"fastest returned {worst:.2f}")
 
 # 8. Discoverability of 50/100/200/250/400 in one continuous 400 m effort.
 items = free(16, 22.0)
@@ -167,6 +188,56 @@ r = best(varied, 100)
 check("fastest window chosen (middle 100m = 94.0)", r is not None and abs(r["time_seconds"] - 94.0) < 1e-9, str(r))
 check("schema unchanged: only time_seconds/pace_seconds_per_100m", set(r) == {"time_seconds", "pace_seconds_per_100m"})
 check("pace derived from exact target distance", abs(r["pace_seconds_per_100m"] - 94.0) < 1e-9)
+
+# 9. Continuity: lengthIndex must NEVER override an observed timestamp gap (and
+#    vice versa); rest / invalid records are hard barriers.
+def raw(rows):
+    """rows: (lengthIndex, start_offset_seconds, duration). One lap of 25 m freestyle lengths."""
+    def stamp(off):
+        whole = int(off // 1)
+        frac = int(round((off - whole) * 10))
+        return (BASE + timedelta(seconds=whole)).strftime("%Y-%m-%dT%H:%M:%S") + f".{frac}"
+    lens = [{"lengthIndex": i, "startTimeGMT": stamp(s), "distance": 25.0, "duration": d,
+             "swimStroke": "FREESTYLE", "totalNumberOfStrokes": 9} for i, s, d in rows]
+    return {"lapDTOs": [{"distance": 25.0 * len(lens), "duration": sum(r[2] for r in rows), "lengthDTOs": lens}]}
+
+
+def two(gap, i2=2):
+    return raw([(1, 100.0, 22.0), (i2, 122.0 + gap, 22.0)])
+
+
+def found50(splits):
+    return pq._best_swim_distance(splits, 50) is not None
+
+
+check("idx consecutive + 5.0 s timestamp gap -> REJECTED (index cannot override time)", not found50(two(5.0)))
+check("idx consecutive + 1.5 s timestamp gap -> REJECTED", not found50(two(1.5)))
+check("idx consecutive + 0.9 s gap (whole-second truncation noise) -> accepted", found50(two(0.9)))
+check("idx consecutive + 0.9 s overlap (truncation noise) -> accepted", found50(two(-0.9)))
+check("idx consecutive + 3.0 s overlap -> REJECTED", not found50(two(-3.0)))
+check("timestamps aligned but lengthIndex skips 1->3 -> REJECTED (time cannot override index)", not found50(two(0.0, i2=3)))
+check("timestamps aligned + consecutive lengthIndex -> accepted", found50(two(0.0)))
+
+a_lap = raw([(1, 100.0, 22.0)])["lapDTOs"]
+b_lap = raw([(2, 122.0, 22.0)])["lapDTOs"]
+rest_empty = {"distance": 0.0, "duration": 0.5, "lengthDTOs": []}
+rest_tagged = {"distance": 25.0, "duration": 0.5, "intensityType": "REST",
+               "lengthDTOs": [{"lengthIndex": 99, "distance": 25.0, "duration": 22.0, "swimStroke": "FREESTYLE",
+                               "totalNumberOfStrokes": 9, "startTimeGMT": "2026-08-04T17:00:00.0"}]}
+check("rest lap (no length records) between index-consecutive, time-aligned lengths -> barrier",
+      not found50({"lapDTOs": a_lap + [rest_empty] + b_lap}))
+check("lap tagged REST is a barrier between lengths",
+      not found50({"lapDTOs": a_lap + [rest_tagged] + b_lap}))
+check("lap tagged REST: its own length records are not used as a PR",
+      pq._best_swim_distance({"lapDTOs": [rest_tagged]}, 25) is None)
+
+# 10. 25-yard pool (Garmin lengths of 22.86 m): meter-target PRs are impossible by design.
+yd = [L("FREESTYLE", 20.0, dist=22.86) for _ in range(24)]
+for tgt in (25, 50, 100, 200, 250, 400):
+    check(f"25-yd pool lengths (22.86 m): {tgt} m PR not constructible", best(yd, tgt) is None)
+r = best(yd, 91.44)
+check("25-yd pool: exact 100 yd (91.44 m) effort IS constructible (reported in meters only)",
+      r is not None and abs(r["time_seconds"] - 80.0) < 1e-9, str(r))
 
 # Housekeeping edge cases.
 check("empty splits -> None", pq._best_swim_distance({}, 50) is None)
