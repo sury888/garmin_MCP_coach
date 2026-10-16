@@ -91,9 +91,13 @@ def _activity_start(activity: Activity) -> datetime:
     return datetime.combine(activity_date, datetime.min.time(), tzinfo=timezone.utc) if activity_date else datetime.min.replace(tzinfo=timezone.utc)
 
 def _period_bounds(window_days: int | None, period: str | None):
-    """Return inclusive [start, end] calendar dates or rolling window bounds."""
+    """Return inclusive [start, end] dates; None/all-time means all history."""
     today = date.today()
-    p = (period or "").lower().strip()
+    p = (period or "").lower().strip().replace("-", "_").replace(" ", "_")
+    if p in {"all", "all_time", "alltime", "ever", "lifetime", "entire_history"} or (not p and window_days is None):
+        # Use the minimum representable date so historical records are not
+        # silently truncated to an arbitrary lookback window.
+        return date.min, today
     if p in {"month", "calendar_month", "current_month"}:
         start = today.replace(day=1)
         if start.month == 12:
@@ -881,8 +885,11 @@ def _swim_pr_pace_ok(distance_m, duration_s):
     return _SWIM_PR_MIN_PACE_S_PER_100M <= pace100 <= _SWIM_PR_MAX_PACE_S_PER_100M
 
 
-def _swim_pr_sequence(splits):
+def _swim_pr_sequence(splits, pool_m=None):
     """Ordered Garmin swim records for PR search.
+
+    pool_m is the expected length distance in meters (from a validated course);
+    when None it is the most common recorded length distance.
 
     Returns a list whose items are either a valid-length dict or None. None is
     a barrier: a rest record, an excluded record (drill, zero-stroke,
@@ -946,10 +953,12 @@ def _swim_pr_sequence(splits):
                 "start": _swim_pr_epoch(length.get("startTimeGMT") or length.get("startTime")),
             })
 
-    # Pool length = most common recorded length distance. Any length that is
-    # not a full pool length is a partial/non-standard length: also a barrier.
-    if pool_counts:
+    # Pool length = the validated course length when given, else the most common
+    # recorded length distance. Any length that is not a full pool length is a
+    # partial/non-standard length: also a barrier.
+    if pool_m is None and pool_counts:
         pool_m = max(pool_counts.items(), key=lambda item: item[1])[0]
+    if pool_m is not None:
         seq = [
             rec if rec is None or abs(rec["distance_m"] - pool_m) <= _SWIM_PR_DISTANCE_TOL_M else None
             for rec in seq
@@ -989,38 +998,99 @@ def _swim_pr_runs(seq):
     return runs
 
 
-def _swim_pr_candidates(splits, target_m, stroke_filter=None):
-    """Every valid exact-distance effort: continuous, one stroke, whole lengths."""
-    target_m = _num(target_m)
-    if target_m is None or target_m <= 0:
+# ---------------------------------------------------------------------------
+# Pool courses (meters vs yards).
+#
+# Garmin stores pool_length in centimeters (2500 = 25 m, 2286 = 25 yd) and
+# records every length distance in meters (a 25-yard length is 22.86 m). A
+# session is only assigned a course when the pool_length metadata names a
+# supported pool AND the lengths recorded in the splits have that same size.
+# Missing, unsupported or conflicting metadata leaves the session unclassified;
+# it is never guessed from a distance that happens to convert to a target.
+# ---------------------------------------------------------------------------
+_SWIM_UNIT_M = {"meters": 1.0, "yards": 0.9144}
+_SWIM_UNIT_ABBR = {"meters": "m", "yards": "yd"}
+_SWIM_UNIT_ALIASES = {
+    "meters": "meters", "meter": "meters", "metres": "meters", "metre": "meters", "m": "meters",
+    "yards": "yards", "yard": "yards", "yds": "yards", "yd": "yards",
+}
+_SWIM_COURSES = (("meters", 25.0), ("meters", 50.0), ("yards", 25.0), ("yards", 50.0))
+_SWIM_POOL_TOL_M = 0.05
+# Common PR targets, each in its own course's unit.
+SWIM_PR_TARGETS = {
+    "meters": (25, 50, 100, 200, 250, 400, 800, 1000, 1500, 1900, 3800),
+    "yards": (25, 50, 100, 200, 400, 500, 800, 1000, 1650),
+}
+
+
+
+def _swim_pr_candidates(splits, target, stroke_filter=None, unit="meters", pool_m=None):
+    """Every valid exact-distance effort: continuous, one stroke, whole lengths.
+
+    target is in `unit` ("meters" or "yards") and exactness is judged in that
+    unit. The plausibility floor is always judged on the actual meters swum, so
+    it means the same speed whichever unit the target is expressed in.
+    """
+    target = _num(target)
+    unit_m = _SWIM_UNIT_M.get(unit)
+    if target is None or target <= 0 or unit_m is None:
         return []
+
     wanted = str(stroke_filter).strip().lower() if stroke_filter else ""
+
+    # Use the validated pool length instead of accumulating rounded Garmin
+    # length distances. This prevents small rounding errors from hiding PRs.
+    effective_pool_m = _num(pool_m)
+    if effective_pool_m is None:
+        effective_pool_m = _swim_recorded_pool_m(splits)
+
     out = []
-    for run in _swim_pr_runs(_swim_pr_sequence(splits)):
+    for run in _swim_pr_runs(_swim_pr_sequence(splits, effective_pool_m)):
         stroke = run[0]["stroke"]
         if wanted and wanted not in stroke.lower():
             continue
+
+        target_m = target * unit_m
+
         for start in range(len(run)):
-            total_d = total_t = 0.0
+            total_t = 0.0
+
             for count, rec in enumerate(run[start:], start=1):
-                total_d += rec["distance_m"]
                 total_t += rec["duration_s"]
-                if total_d > target_m + _SWIM_PR_DISTANCE_TOL_M:
+
+                total_m = (
+                    count * effective_pool_m
+                    if effective_pool_m is not None
+                    else sum(
+                        item["distance_m"]
+                        for item in run[start:start + count]
+                    )
+                )
+
+                if total_m > target_m + _SWIM_PR_DISTANCE_TOL_M:
                     break
-                if abs(total_d - target_m) <= _SWIM_PR_DISTANCE_TOL_M:
-                    if _swim_pr_pace_ok(target_m, total_t):
+
+                if abs(total_m - target_m) <= _SWIM_PR_DISTANCE_TOL_M:
+                    if _swim_pr_pace_ok(total_m, total_t):
                         out.append({
                             "time_seconds": total_t,
-                            "pace_seconds_per_100m": total_t / target_m * 100.0,
+                            "pace_seconds_per_100_unit": (
+                                total_t / target * 100.0
+                            ),
                             "stroke": stroke,
                             "lengths": count,
                         })
                     break
+
     return out
 
 
 def _best_swim_distance(splits, target_m, stroke_filter=None):
-    """Fastest valid continuous swim effort of exactly target_m meters."""
+    """Fastest valid continuous swim effort of exactly target_m meters.
+
+    Legacy metric entry point (response schema unchanged). It is course-agnostic:
+    callers decide which sessions are eligible (see _swim_meter_legacy_ok).
+    """
     best = None
     for candidate in _swim_pr_candidates(splits, target_m, stroke_filter):
         if best is None or candidate["time_seconds"] < best["time_seconds"]:
@@ -1029,8 +1099,178 @@ def _best_swim_distance(splits, target_m, stroke_filter=None):
         return None
     return {
         "time_seconds": best["time_seconds"],
-        "pace_seconds_per_100m": best["pace_seconds_per_100m"],
+        "pace_seconds_per_100m": best["pace_seconds_per_100_unit"],
     }
+
+
+def _swim_declared_course(pool_length):
+    """Course named by the pool_length metadata (centimeters), or None."""
+    cm = _num(pool_length)
+    if cm is None or cm <= 0:
+        return None
+    pool_m = cm / 100.0
+    for unit, size in _SWIM_COURSES:
+        expected = size * _SWIM_UNIT_M[unit]
+        if abs(pool_m - expected) <= _SWIM_POOL_TOL_M:
+            return {"unit": unit, "pool_size": size, "pool_m": expected}
+    return None
+
+
+def _swim_recorded_pool_m(splits):
+    """Most common recorded length distance (meters), or None."""
+    counts = {}
+    for lap in (splits or {}).get("lapDTOs", []) or []:
+        for length in lap.get("lengthDTOs", []) or []:
+            dist = _num(_first(length, "distance", "distanceMeters", "lengthDistance", "distanceInMeters"))
+            dur = _num(_first(length, "duration", "durationSeconds", "lengthDuration"))
+            if dist is None or dist <= 0 or dur is None or dur <= 0:
+                continue
+            counts[round(dist, 2)] = counts.get(round(dist, 2), 0) + 1
+    return max(counts.items(), key=lambda item: item[1])[0] if counts else None
+
+
+def _swim_course(pool_length, splits):
+    """Validated course for one activity -> (course | None, reason)."""
+    declared = _swim_declared_course(pool_length)
+    if declared is None:
+        return None, ("no_pool_length" if _num(pool_length) is None else "unsupported_pool_length")
+    recorded = _swim_recorded_pool_m(splits)
+    if recorded is None:
+        return None, "no_length_records"
+    if abs(recorded - declared["pool_m"]) > _SWIM_POOL_TOL_M:
+        return None, "pool_length_conflicts_with_lengths"
+    return declared, "ok"
+
+
+def _swim_meter_legacy_ok(pool_length, splits):
+    """Eligibility for the legacy meter query.
+
+    Only verified meter courses qualify; a yard-course or conflicting session
+    never does. A session with no pool metadata at all keeps working (as it did
+    before courses existed) when its recorded lengths are a standard metric pool.
+    """
+    course, reason = _swim_course(pool_length, splits)
+    if course is not None:
+        return course["unit"] == "meters"
+    if reason == "no_pool_length":
+        recorded = _swim_recorded_pool_m(splits)
+        return recorded is not None and any(abs(recorded - s) <= _SWIM_POOL_TOL_M for s in (25.0, 50.0))
+    return False
+
+
+def _best_swim_effort(splits, target, unit, stroke_filter, course):
+    """Fastest valid effort of exactly `target` `unit`s on a validated course."""
+    best = None
+    for candidate in _swim_pr_candidates(splits, target, stroke_filter, unit, course["pool_m"]):
+        if best is None or candidate["time_seconds"] < best["time_seconds"]:
+            best = candidate
+    return best
+
+
+def _swim_pace_label(seconds, unit):
+    n = int(round(seconds))
+    return f"{n // 60}:{n % 60:02d}/100{_SWIM_UNIT_ABBR[unit]}"
+
+
+def _swim_pr_row(unit, target, entry, swim_stroke):
+    """One target's result. Distance and pace keys carry the course's own unit."""
+    if entry is None:
+        return {"target": target, "found": False}
+    activity, effort, course = entry["activity"], entry["effort"], entry["course"]
+    abbr = _SWIM_UNIT_ABBR[unit]
+    pace = effort["pace_seconds_per_100_unit"]
+    return {
+        "target": target,
+        "found": True,
+        "activity_id": activity.activity_id,
+        "date": str(activity.activity_date),
+        "activity_name": activity.activity_name,
+        "surface": _surface(activity, "swim"),
+        "pace_source": "garmin_swim_lengths",
+        "pool_length": course["pool_size"],
+        "pool_length_unit": unit,
+        f"distance_{unit}": target,
+        "time_seconds": round(effort["time_seconds"], 2),
+        f"pace_seconds_per_100{abbr}": round(pace, 2),
+        f"pace_per_100{abbr}": _swim_pace_label(pace, unit),
+        "stroke": effort["stroke"],
+        "stroke_filter": swim_stroke,
+    }
+
+
+def get_best_swim_performance(
+    unit: str = "yards",
+    target: float | None = None,
+    window_days: int = 30,
+    swim_stroke: str | None = None,
+    period: str | None = None,
+):
+    """Best exact swim efforts, calculated and reported in the pool's own unit.
+
+    Only sessions whose course is verified (see _swim_course) and is in the
+    requested unit are searched, so a yard effort is never reported or compared
+    as a meter effort. target=None searches the common targets for the unit.
+    """
+    unit = _SWIM_UNIT_ALIASES.get(str(unit or "").strip().lower())
+    if unit is None:
+        return {"error": "unit must be yards or meters"}
+    if target is None:
+        targets = SWIM_PR_TARGETS[unit]
+    else:
+        value = _num(target)
+        if value is None or value <= 0:
+            return {"error": "target must be greater than zero"}
+        targets = (value,)
+
+    period_start, period_end = _period_bounds(window_days, period)
+    base = {
+        "sport": "swim",
+        "course_unit": unit,
+        "target_units": unit,
+        "window_days": window_days,
+        "period": period,
+        "period_start": str(period_start),
+        "period_end": str(period_end),
+    }
+    activities = _activity_query("swim", window_days, period)
+    if not activities:
+        return {**base, "found": False, "results": [], "reason": "No activities in requested period."}
+
+    g = get_garmin_client()
+    best = {t: None for t in targets}
+    in_course = other_unit = 0
+    unclassified = {}
+    errors = []
+    for activity in activities:
+        try:
+            splits = g.get_activity_splits(activity.activity_id)
+            course, reason = _swim_course(getattr(activity, "pool_length", None), splits)
+            if course is None:
+                unclassified[reason] = unclassified.get(reason, 0) + 1
+                continue
+            if course["unit"] != unit:
+                other_unit += 1
+                continue
+            in_course += 1
+            for t in targets:
+                effort = _best_swim_effort(splits, t, unit, swim_stroke, course)
+                if effort and (best[t] is None or effort["time_seconds"] < best[t]["effort"]["time_seconds"]):
+                    best[t] = {"activity": activity, "effort": effort, "course": course}
+        except Exception as exc:
+            errors.append({"activity_id": activity.activity_id, "error": str(exc)})
+
+    rows = [_swim_pr_row(unit, t, best[t], swim_stroke) for t in targets]
+    out = {
+        **base,
+        "found": any(row["found"] for row in rows),
+        "activities_considered": len(activities),
+        "activities_in_course": in_course,
+        "activities_excluded": {"other_course_unit": other_unit, "unclassified": unclassified},
+        "results": rows,
+    }
+    if errors:
+        out["errors"] = errors[-5:]
+    return out
 
 def _manual_treadmill_intervals(activity_id: int):
     try:
@@ -1257,6 +1497,15 @@ def get_best_performance(
     if target is None or target <= 0:
         return {"error": "target must be greater than zero"}
 
+    # Explicit all-time aliases and window_days=None both mean all history.
+    # The default window_days=30 remains unchanged for existing callers.
+    normalized_period = (period or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized_period in {"all", "all_time", "alltime", "ever", "lifetime", "entire_history"}:
+        period = "all_time"
+        window_days = None
+    elif window_days is None and not normalized_period:
+        period = "all_time"
+
     metric = (
         "duration"
         if metric == "auto" and sport == "bike"
@@ -1292,11 +1541,11 @@ def get_best_performance(
             treadmill = sport == "run" and _is_treadmill(activity)
 
             if sport == "swim":
-                result = _best_swim_distance(
-                    g.get_activity_splits(activity.activity_id),
-                    target,
-                    swim_stroke,
-                )
+                splits = g.get_activity_splits(activity.activity_id)
+                # Meter query: never use a yard-course (or unverifiable) session.
+                if not _swim_meter_legacy_ok(getattr(activity, "pool_length", None), splits):
+                    continue
+                result = _best_swim_distance(splits, target, swim_stroke)
                 source = "garmin_swim_lengths"
 
             elif sport == "run" and treadmill:
@@ -1366,13 +1615,19 @@ def get_best_performance(
 
     period_start, period_end = _period_bounds(window_days, period)
 
+    reported_period_start = (
+        min((a.activity_date for a in activities if getattr(a, "activity_date", None)), default=None)
+        if period == "all_time"
+        else period_start
+    )
+
     out = {
         "sport": sport,
         "target": target,
         "target_units": "seconds" if sport == "bike" else "meters",
         "window_days": window_days,
         "period": period,
-        "period_start": str(period_start),
+        "period_start": str(reported_period_start) if reported_period_start else None,
         "period_end": str(period_end),
         "found": True,
         "activity_id": activity.activity_id,

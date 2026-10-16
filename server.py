@@ -36,7 +36,7 @@ from performance_engine import (
     process_activity_performance, get_hr_controlled_records,
     get_highest_hr_history, get_leaderboard, get_durability_records,
 )
-from performance_queries import get_best_performance, get_time_in_zone, set_training_zones
+from performance_queries import get_best_performance, get_best_swim_performance, get_time_in_zone, set_training_zones
 
 mcp = MCPServer("Garmin Coach")
 
@@ -131,8 +131,36 @@ def get_best_performance_query(
 
     Run/swim targets are meters; bike targets are seconds. This complements
     the cached peak-performance curve and supports arbitrary queries.
+
+    Set window_days to the desired lookback (e.g. 90 or 180); pass null for
+    all available history. period may also be "all_time", "ever", "lifetime",
+    or a calendar period such as "current_month" / "previous_week".
+
+    Swim targets here are meters on verified metric (25 m / 50 m) pools only;
+    use get_best_swim_performance_query for yard pools and yard targets.
     """
     return get_best_performance(sport, target, metric, window_days, swim_stroke, period)
+
+
+@mcp.tool()
+def get_best_swim_performance_query(
+    unit: str = "yards",
+    target: float | None = None,
+    window_days: int = 30,
+    swim_stroke: str | None = None,
+    period: str | None = None,
+) -> dict:
+    """Find the best exact swim effort in the pool's own unit (yards or meters).
+
+    Only sessions whose pool course is verified (Garmin pool_length matches the
+    recorded lengths) and is in the requested unit are used, so a yard effort is
+    never reported or compared as a meter effort. Yard results report
+    distance_yards / pace_seconds_per_100yd; meter results report
+    distance_meters / pace_seconds_per_100m. Efforts are continuous, single
+    stroke and end exactly on whole pool lengths. Omit target for the common
+    distances of that unit (yards: 25-1650; meters: 25-3800).
+    """
+    return get_best_swim_performance(unit, target, window_days, swim_stroke, period)
 
 @mcp.tool()
 def set_training_zones_tool(config: dict) -> dict:
